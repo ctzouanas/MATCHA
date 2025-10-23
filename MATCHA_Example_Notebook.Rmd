@@ -1,0 +1,499 @@
+```{r Install MATCHA package}
+# remotes::install_github("ctzouanas/MATCHA")
+```
+
+```{r Read in packages}
+library(MATCHA)
+library(Seurat)
+library(network)
+library(Signac)
+library('BSgenome.Mmusculus.UCSC.mm10')
+library('EnsDb.Mmusculus.v79')
+library(stringr)
+library(chromVAR)
+library(ggraph)
+library(patchwork)
+library(writexl)
+library(readxl)
+library(janitor)
+library(plyr)
+library(tidyverse)
+library(cicero)
+library(TFBSTools)
+library(JASPAR2020)
+library(SeuratWrappers)
+library(SummarizedExperiment)
+library(paletteer)
+library(ggthemes)
+library(Matrix)
+library(ggrepel)
+library(msigdbr)
+library(grDevices)
+library(stats)
+library(utils)
+library(GenomeInfoDb)
+library(igraph)
+library(tibble)
+```
+
+```{r Download all files needed for this notebook from Single Cell Portal}
+# Download all needed files for this example code from the "Download" tab of https://singlecell.broadinstitute.org/single_cell/study/SCP3352
+# There are five needed files in total, each with a description starting with "MATCHA Tutorial File"
+# The five needed files are MATCHATutorial_LiverStress_ChronicStressAdaptation_FrozenTissuesnRNA.rds,
+# MATCHATutorial_LiverStress_ChronicStressAdaptation_snATAC.rds,
+# HumanMouseConversionDataFrame.txt,
+# GSE135251_HumanMASLDBulkRNA.rds,
+# snATAC_Precomputed_Conns.rds
+
+# All five files must be placed into a single folder, whose path is listed below
+matcha.file.folder <- 'path/to/MATCHA_Compiled_Files'
+
+# Folder to store outputs from this notebook
+storage.folder <- "path/to/MATCHA_Output_Files"
+if(!dir.exists(storage.folder)){
+  dir.create(storage.folder)
+}
+
+```
+
+```{r Read in all objects and external datasets}
+# Read in objects for this notebook that you downloaded from the "Download" tab of https://singlecell.broadinstitute.org/single_cell/study/SCP3352
+
+# For multi-omic workflow, there need to be identical sets of samples between RNA object and ATAC object
+# All sample names should avoid special characters that could cause downstream parsing/matching issues
+# I would recommend passing sample names through the function janitor::make_clean_names()
+# Make sure to avoid underscores, as Seurat will convert those to hyphens
+if(!exists("hep.snRNA.obj")){
+  hep.snRNA.obj <- readRDS(paste0(matcha.file.folder, "/", "MATCHATutorial_LiverStress_ChronicStressAdaptation_FrozenTissuesnRNA.rds"))
+  Idents(hep.snRNA.obj) <- "tzouanas_cell_type"
+  hep.snRNA.obj <- hep.snRNA.obj[, hep.snRNA.obj$tzouanas_cell_type == "Hepatocyte"]
+  Seurat::DefaultAssay(hep.snRNA.obj) <- "RNA"
+}
+
+if(!exists("hep.snATAC.obj")){
+  hep.snATAC.obj <- readRDS(paste0(matcha.file.folder, "/", "MATCHATutorial_LiverStress_ChronicStressAdaptation_snATAC.rds"))
+  hep.snATAC.obj <- hep.snATAC.obj[, hep.snATAC.obj$tzouanas_cell_type == "Hepatocyte"]
+  Seurat::DefaultAssay(hep.snATAC.obj) <- "ATAC"
+}
+
+if(!exists("mouse.human.conversion.df")) {
+  mouse.human.conversion.df <- read.table(
+    paste0(matcha.file.folder, "/", "HumanMouseConversionDataFrame.txt"),
+    sep = "\t", header = TRUE)
+}
+
+if(!exists("govaere.bulk.obj")) {
+  govaere.bulk.obj <- readRDS(paste0(matcha.file.folder, "/", "GSE135251_HumanMASLDBulkRNA.rds"))
+  colnames(govaere.bulk.obj) <- janitor::make_clean_names(colnames(govaere.bulk.obj))
+  govaere.bulk.obj$patient.number <- janitor::make_clean_names(govaere.bulk.obj$patient.number)
+  
+  govaere.conversion.df <- govaere.bulk.obj@misc$ensembl.to.hgnc.df
+  govaere.conversion.withmouse.df <- dplyr::full_join(x = mouse.human.conversion.df,
+                                                      y = govaere.conversion.df,
+                                                      by = c("HGNC.symbol" = "hgnc_symbol"))
+  Seurat::DefaultAssay(govaere.bulk.obj) <- "RNA"
+}
+
+```
+
+```{r Create list of gene programs of interest}
+# Establish gene programs of interest.
+# These can be any sets of processes or phenotypes for which you would like to identify core central hub transcription factors
+# Here, we will choose liver-relevant gene programs from GO:BP and Reactome, as accessed through MSigDB and the package msigdbr,
+# as well as an example of providing a "curated" gene program (derived from GO:BP Fatty Acid Beta Oxidation)
+# Could also define them based on prior biological knowledge, top differentially-expressed genes, etc.
+# In brief, any set of genes that is likely to represent a coherent response mechanism to activation of a transcription factor
+msigdb.gobp.df <- msigdbr::msigdbr(
+  species = "Mus musculus", 
+  collection = "C5", 
+  subcollection = "GO:BP")
+reactome.df <- msigdbr::msigdbr(
+  species = "Mus musculus",
+  collection = "C2",
+  subcollection = "CP:REACTOME"
+)
+
+oxid.stress.set <- msigdb.gobp.df %>%
+  dplyr::filter(gs_name == "GOBP_RESPONSE_TO_OXIDATIVE_STRESS") %>%
+  split(x = .$gene_symbol, f = .$gs_name) %>%
+  unlist()
+
+er.stress.set <- msigdb.gobp.df %>%
+  dplyr::filter(gs_name == "GOBP_POSITIVE_REGULATION_OF_RESPONSE_TO_ENDOPLASMIC_RETICULUM_STRESS") %>%
+  split(x = .$gene_symbol, f = .$gs_name) %>%
+  unlist()
+
+cholesterol.synth.set <- reactome.df %>%
+  dplyr::filter(gs_name == "REACTOME_CHOLESTEROL_BIOSYNTHESIS") %>%
+  split(x = .$gene_symbol, f = .$gs_name) %>%
+  unlist()
+
+xenobiotics.set <- reactome.df %>%
+  dplyr::filter(gs_name == "REACTOME_XENOBIOTICS") %>%
+  split(x = .$gene_symbol, f = .$gs_name) %>%
+  unlist()
+
+# From GO:BP Fatty Acid Beta Oxidation; intended to be an example of how to
+# format a user-specified gene program derived in one's own project
+beta.oxid.set <- c("Abcb11", "Abcd1", "Abcd2", "Abcd3", "Abcd4", "Acaa1a", 
+                   "Acaa2", "Acacb", "Acad10", "Acad11", "Acadl", "Acadm", 
+                   "Acads", "Acadvl", "Acat1", "Acat3", "Acot8", "Acox1", 
+                   "Acox2", "Acox3", "Acoxl", "Adipoq", "Akt1", "Akt2", 
+                   "Aldh1l2", "Amacr", "Auh", "Bdh2", "Cnr1", "Cpt1a", "Cpt1b",
+                   "Cpt1c", "Cpt2", "Crat", "Crot", "Decr1", "Decr2", "Ech1", 
+                   "Echdc1", "Echdc2", "Echs1", "Eci1", "Eci2", "Ehhadh", 
+                   "Etfa", "Etfb", "Etfbkmt", "Etfdh", "Fabp1", "Gcdh", "Hadh",
+                   "Hadha", "Hadhb", "Hsd17b10", "Hsd17b4", "Irs1", "Irs2",
+                   "Ivd", "Lep", "Lonp2", "Mcat", "Mfsd2a", "Mlycd", "Mtln",
+                   "Pex2", "Pex5", "Pex7", "Plin5", "Ppara", "Ppard", "Scp2",
+                   "Sesn2", "Slc25a17", "Slc27a2", "Twist1", "Tysnd1")
+
+gene.list <- 
+  list("beta_oxidation" = beta.oxid.set, 
+       "oxidative_stress_response" = oxid.stress.set, 
+       "er_stress_response" = er.stress.set, 
+       "cholesterol_synthesis" = cholesterol.synth.set,
+       "xenobiotics" = xenobiotics.set)
+
+names(gene.list) <- janitor::make_clean_names(names(gene.list))
+```
+
+```{r Example code to set up clean ATAC object}
+clean.atac.counts <- hep.snATAC.obj@assays$ATAC@counts
+clean.atac.metadata <- hep.snATAC.obj@meta.data
+clean.atac.assay <- Signac::CreateChromatinAssay(
+  counts = clean.atac.counts,
+  sep = c(":", "-"),
+  genome = "mm10",
+  min.cells = 1
+)
+
+clean.atac.obj <- Seurat::CreateSeuratObject(
+  counts = clean.atac.assay,
+  assay = 'ATAC',
+  project = 'CleanATAC',
+  meta.data = clean.atac.metadata
+)
+clean.atac.obj <- Signac::RunTFIDF(clean.atac.obj)
+
+rm(hep.snATAC.obj)
+rm(clean.atac.counts)
+rm(clean.atac.metadata)
+rm(clean.atac.assay)
+gc()
+```
+
+```{r Example code to add annotations and motifs to ATAC object}
+# For mm10, use "EnsDb.Mmusculus.v79" and "BSgenome.Mmusculus.UCSC.mm10"
+annotations <- Signac::GetGRangesFromEnsDb(
+  ensdb = EnsDb.Mmusculus.v79
+)
+Signac::seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+Signac::genome(annotations) <- "mm10"
+Signac::Annotation(clean.atac.obj) <- annotations
+
+pfm <- TFBSTools::getMatrixSet(
+  x = JASPAR2020::JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+pfm.motif.df <- data.frame()
+for(ii in 1:length(pfm@listData)){
+  listData.ii <- pfm@listData[[ii]]
+  motif.ii <- data.frame(orig.colnames = listData.ii@ID, tf.name = listData.ii@name)
+  pfm.motif.df <- rbind(pfm.motif.df, motif.ii)
+}
+
+clean.atac.obj <- Signac::AddMotifs(
+  object = clean.atac.obj,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+clean.atac.obj@misc$chromvar.meta.features <- pfm.motif.df
+
+candidate.tf.names <- pfm.motif.df %>%
+  dplyr::mutate(tf.name = gsub(pattern = "\\(var.[0-9]\\)", replacement = "", x = .$tf.name)) %>%
+  tidyr::separate(col = tf.name, into = c("TF.1", "TF.2", "TF.3"), sep = "::") %>%
+  tidyr::pivot_longer(!orig.colnames, names_to = "TF.num", values_to = "TF.name", values_drop_na = TRUE) %>% 
+  dplyr::select(!TF.num) %>%
+  dplyr::left_join(x = .,
+                   y = mouse.human.conversion.df, 
+                   by = c("TF.name" = "HGNC.symbol")) %>%
+  dplyr::mutate(MGI.symbol = if_else(is.na(MGI.symbol), TF.name, MGI.symbol)) %>%
+  dplyr::left_join(x = .,
+                   y = mouse.human.conversion.df,
+                   by = c("TF.name" = "MGI.symbol")) %>%
+  dplyr::mutate(HGNC.symbol = if_else(is.na(HGNC.symbol), TF.name, HGNC.symbol)) %>%
+  dplyr::distinct() %>%
+  dplyr::select(!TF.name) %>%
+  dplyr::rename(motif.name = 1)
+```
+
+```{r Example code to generate or read in Cicero conns}
+# For speed of use, I provide pre-computed connections between chromatin peaks, calculated using cicero on hepatocyte snATAC-seq. These can be downloaded at the Downloads tab of https://singlecell.broadinstitute.org/single_cell/study/SCP3352
+# Alternatively, you can use the below example code to calculate your own.
+# Any approach to specify chromatin regions that are somehow "linked" would be acceptable
+conns.path <- paste0(matcha.file.folder, "/", "snATAC_Precomputed_Conns.rds")
+if(!exists("conns.filter")){
+  if(file.exists(conns.path)){
+    conns <- readRDS(conns.path)
+  } else{
+    clean.atac.cds <- SeuratWrappers::as.cell_data_set(x = clean.atac.obj)
+    filler.reduce.df <- data.frame(filler.val.x = 1:nrow(pData(clean.atac.cds)), 
+                                   filler.val.y = 1:nrow(pData(clean.atac.cds)))
+    rownames(filler.reduce.df) <- colnames(clean.atac.cds)
+    clean.atac.cicero <- cicero::make_cicero_cds(clean.atac.cds, 
+                                                 reduced_coordinates = filler.reduce.df)
+    genome <- GenomicRanges::seqlengths(clean.atac.obj)
+    # convert chromosome sizes to a dataframe
+    genome.df <- data.frame("chr" = names(genome), "length" = genome)
+    # run cicero
+    conns <- cicero::run_cicero(clean.atac.cicero, genomic_coords = genome.df, sample_num = 100)
+    
+    saveRDS(
+      object = conns,
+      file = conns.path
+    )
+  }
+}
+
+conns.filter <- conns %>% 
+  dplyr::filter(!is.na(coaccess)) %>%
+  dplyr::filter(coaccess > 0)
+```
+
+```{r Set up mouse tandem-omics snRNA-seq and snATAC-seq objects for multi-omic workflow}
+# For multi-omic or tandem -omic datasets (i.e., same samples were measured with both snRNA-seq and snATAC-seq)
+# Below datasets were originally generated and published in Tzouanas*, Shay*, Sherman*, et al.
+
+# Important: Identical sample names/identities between the two objects, stored in the
+# sample fields indicated by "atac.sample.field" and "rna.sample.field". These 
+# will indicate which samples have matched transcriptomic and epigenetic
+# measurements. These sample names/identities should also avoid special
+# characters (passing them through janitor::make_clean_names() will help). 
+
+# Important: Consistent mapping of gene names. gene.name.conversion should
+# be a dataframe of two columns, where the first column is named name.universal,
+# for the gene name that everything will be mapped to. The second column is named
+# name.datasetspecific, for dataset-specific gene names. If NULL, it is assumed
+# that genes in the RNA dataset are already in the name.universal nomenclature.
+
+# Important: Consistent mapping of transcription factor motif names. motif.name.conversion
+# should be a dataframe of three columns, where the first column is named motif.name,
+# as from your motif source of choice (e.g., JASPAR2020). Second and third columns
+# should be name.universal and name.datasetspecific, as described above. 
+rna.atac.combo.list <- list(
+  # Arbitrary name for what you'd like to name this dataset in saved files. Should be a "clean" name that passes janitor::make_clean_names()
+  "dataset.name" = "mouse_longitudinalstress",
+  # Signac (sn)ATAC-seq object
+  "clean.atac.obj" = clean.atac.obj,
+  # Signac object metadata field specific which cells are from which sample.
+  # Should indicate matched samples as in "rna.sample.field" below
+  "atac.sample.field" = "biosample_id",
+  # Name in Signac object for assay to use
+  "atac.assay.name" = "ATAC",
+  # Seurat (sn)RNA-seq object
+  "clean.rna.obj" = hep.snRNA.obj,
+  # Seurat object metadata field specific which cells are from which sample.
+  # Should indicate matched samples as in "atac.sample.field" above
+  "rna.sample.field" = "biosample_id",
+  # Name in Seurat object for assay to use
+  "rna.assay.name" = "RNA",
+  # Connections dataframe specifying which chromatin peaks are co-accessible with each other. 
+  # See above for example calculation wtih cicero
+  "conns" = conns.filter,
+  # Only chromatin peaks closer than this genomic distance, in base pairs, will be considered as co-accessible
+  "search.window" = 500000,
+  # Only chromatin peaks with stronger co-accessibility than this value, as calculated through a method like Cicero, will be considered as co-accessible
+  "strength.filter" = 0,
+  
+  "ensdb.chosen" = EnsDb.Mmusculus.v79,
+  "bsgenome.chosen" = BSgenome.Mmusculus.UCSC.mm10,
+  # Dataframe to map gene names in the (sn)RNA object.
+  # One column should be named name.universal, for core gene name to be mapped across all objects
+  # One column should be named name.datasetspecific, for name specific to this dataset
+  # Can be NULL, which will indicate that (sn)RNA object already has gene names in universal format
+  "gene.name.conversion" = NULL,
+  # Dataframe to map transcription factor motif names
+  # One column should be named motif.name, for motif name (e.g., as from JASPAR2020)
+  # One column should be named name.universal, for core gene name to be mapped across all objects
+  # One column should be named name.datasetspecific, for name specific to this dataset
+  # See above in notebook for example
+  "motif.name.conversion" = candidate.tf.names %>%
+    dplyr::select(motif.name, MGI.symbol) %>%
+    dplyr::rename(name.universal = 2) %>%
+    dplyr::mutate(name.datasetspecific = name.universal)
+)
+```
+
+```{r Set up human bulk RNA-seq object for RNA-only workflow}
+# For datasets where samples were measured with snRNA-seq or RNA-seq alone
+# Below dataset was originally generated in Govaere et al.
+govaere.conversion.format.df <- 
+  dplyr::full_join(x = mouse.human.conversion.df,
+                   y = govaere.bulk.obj@misc$ensembl.to.hgnc.df,
+                   by = c("HGNC.symbol" = "hgnc_symbol")) %>%
+  dplyr::select(MGI.symbol, ensembl_gene_id) %>%
+  dplyr::rename(name.universal = MGI.symbol, name.datasetspecific = ensembl_gene_id) %>%
+  dplyr::distinct()
+govaere.motif.conversion.df <- inner_join(
+  x = candidate.tf.names,
+  y = govaere.conversion.format.df,
+  by = c("MGI.symbol" = "name.universal")) %>%
+  dplyr::select(!HGNC.symbol) %>%
+  dplyr::rename("name.universal" = "MGI.symbol")
+
+# Important: Consistent mapping of gene names. gene.name.conversion should
+# be a dataframe of two columns, where the first column is named name.universal,
+# for the gene name that everything will be mapped to. The second column is named
+# name.datasetspecific, for dataset-specific gene names. If NULL, it is assumed
+# that genes in the RNA dataset are already in the name.universal nomenclature.
+
+# Important: Consistent mapping of transcription factor motif names. motif.name.conversion
+# should be a dataframe of three columns, where the first column is named motif.name,
+# as from your motif source of choice (e.g., JASPAR2020). Second and third columns
+# should be name.universal and name.datasetspecific, as described above. 
+
+rna.only.list <- list(
+  # Arbitrary name for what you'd like to name this dataset in saved files. Should be a "clean" name that passes janitor::make_clean_names()
+  "dataset.name" = "GovaerebulkRNA",
+  # Seurat (sn)RNA-seq object
+  "clean.rna.obj" = govaere.bulk.obj,
+  # Signac object metadata field specific which cells are from which sample.
+  "rna.sample.field" = "patient.number",
+  # Name in Seurat object for assay to use
+  "rna.assay.name" = "RNA",
+  # Dataframe to map gene names in the (sn)RNA object.
+  # One column should be named name.universal, for core gene name to be mapped across all objects
+  # One column should be named name.datasetspecific, for name specific to this dataset
+  # Can be NULL, which will indicate that (sn)RNA object already has gene names in universal format
+  "gene.name.conversion" = govaere.conversion.format.df,
+  # Dataframe to map transcription factor motif names
+  # One column should be named motif.name, for motif name (e.g., as from JASPAR2020)
+  # One column should be named name.universal, for core gene name to be mapped across all objects
+  # One column should be named name.datasetspecific, for name specific to this dataset
+  # See above in notebook for example
+  "motif.name.conversion" = govaere.motif.conversion.df
+)
+```
+
+```{r Implement multi-omic workflow on mouse liver snRNA-seq and snATAC-seq datasets}
+search.window <- 500000
+strength.filter <- 0
+
+for(ii in 1:length(gene.list)){
+  genes.chosen = gene.list[[ii]] %>% unique()
+  name.chosen = names(gene.list)[[ii]]
+  print(paste0("Starting on gene program ", name.chosen, ". This is gene program ", ii, " of ", length(gene.list), ", and it is currently ", Sys.time()))
+  print(paste0("Currently using a search window of ", search.window/1000, "kb and a coaccessibility filter of ", strength.filter))
+  
+  storagefolder.dataset <- paste0(storage.folder, "/", name.chosen)
+  if(!dir.exists(storagefolder.dataset)){
+    dir.create(storagefolder.dataset)
+  }
+  
+  storagefolder.chosen = paste0(storagefolder.dataset, "/", rna.atac.combo.list[["dataset.name"]], "_", name.chosen, "_", search.window/1000, "kbWindow_", strength.filter, "CoaccessFilter", "_250822")
+  if(!dir.exists(storagefolder.chosen)){
+    dir.create(storagefolder.chosen)
+  }
+  
+  write.table(genes.chosen,
+              file = paste0(storagefolder.chosen, "/", name.chosen, "_ChosenGenes.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  
+  print(paste0("Starting on ", name.chosen, ", ", search.window/1000, "kb window, ", strength.filter, " coaccessibility filter, mapping genes to peaks"))
+  
+  MATCHA::genestopeaks.matcha(
+    rna.atac.combo.list.in = rna.atac.combo.list, 
+    program.name.in = name.chosen,
+    genes.in = genes.chosen, 
+    save.folder.in = storagefolder.chosen
+  )
+  print(paste0("Succeeded on ", name.chosen, ", ", search.window/1000, "kb window, ", strength.filter, " coaccessibility filter, mapping genes to peaks"))
+  
+  rna.atac.combo.list[["clean.atac.obj"]] <- MATCHA::peakstoTFs.matcha(
+    rna.atac.combo.list.in = rna.atac.combo.list,
+    save.folder.in = storagefolder.chosen, 
+    program.name.in = name.chosen)
+  print(paste0("Succeeded on ", name.chosen, ", ", search.window/1000, "kb window, ", strength.filter, " coaccessibility filter, mapping peaks to TFs"))
+  
+  
+  tf.prioritize.df <- MATCHA::TFstoRankedTFs.atac.rna.matcha(
+    rna.atac.combo.list.in = rna.atac.combo.list,
+    save.folder.in = storagefolder.chosen, 
+    program.name.in = name.chosen, 
+    genes.in = genes.chosen)
+  print(paste0("Succeeded on ",  name.chosen, ", ", search.window/1000, "kb window, ", strength.filter, " coaccessibility filter, associating TF motif accessibility at program-specific peaks, TF expression, and program expression"))
+  
+}
+
+```
+
+```{r Implement transcriptomic workflow on human liver bulk RNA-seq dataset}
+for(ii in 1:length(gene.list)){
+  genes.chosen = gene.list[[ii]] %>% unique()
+  name.chosen = names(gene.list)[[ii]]
+  print(paste0("Starting on gene program ", name.chosen, ". This is ", ii, " of ", length(gene.list), ", and it is currently ", Sys.time()))
+  
+  storagefolder.dataset <- paste0(storage.folder, "/", name.chosen)
+  if(!dir.exists(storagefolder.dataset)){
+    dir.create(storagefolder.dataset)
+  }
+  
+  storagefolder.chosen = paste0(storagefolder.dataset, "/", rna.only.list[["dataset.name"]], "_", name.chosen, "_250822")
+  if(!dir.exists(storagefolder.chosen)){
+    dir.create(storagefolder.chosen)
+  }
+  
+  write.table(genes.chosen,
+              file = paste0(storagefolder.chosen, "/", name.chosen, "_ChosenGenes.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  
+  tf.prioritize <- MATCHA::TFstoRankedTFs.rna.only.matcha(
+    rna.only.list.in = rna.only.list,
+    save.folder.in = storagefolder.chosen, 
+    program.name.in = name.chosen, 
+    genes.in = genes.chosen)
+  print(paste0("Succeeded on ", name.chosen, ", associating TF expression and program expression"))
+  
+}
+
+```
+
+```{r Prioritize TFs for a single gene program across datasets}
+for(ii in 1:length(names(gene.list))){
+  name.ii <- names(gene.list)[[ii]]
+  program.folder.ii <- paste0(storage.folder, "/", name.ii)
+  
+  singleprogram.crossdataset.TFprioritize.matcha(
+    folder.in = program.folder.ii, 
+    name.in = name.ii,
+    plot.width = 6, plot.height = 6, plot.font.size = 12
+  )
+}
+```
+
+```{r Prioritize TFs across programs across datasets}
+# Sometimes, ggraph::geom_edge_fan will run into issues of "vector memory exhausted". 
+# Usually, running gc() and/or restarting the R session will fix this.
+# Sometimes, neither of the above options will work; this error will then
+# be resolved by: 1) restarting the R session, 2) only loading in the libraries
+# MATCHA, dplyr, stringr, and ggplot2; 3) setting variables for folder.in and
+# gene.list; and, 4) running multiprogram.crossdataset.TFprioritize.matcha
+
+# multiprogram.crossdataset.TFprioritize.matcha runs on spreadsheets saved in folder.in 
+# as part of preceding functions and does not need to load in Seurat/Signac objects, 
+# so if you end up needing to restart the R session, you can save time by only 
+# setting up needed variables for this last function (i.e., storage.folder and
+# gene.list)
+multiprogram.crossdataset.TFprioritize.matcha(
+  folder.in = storage.folder,
+  gene.list.in = gene.list,
+  n.tfs.per.program = 5,
+  min.tf.degree = 1,
+  graph.layout = "fr",
+  plot.width = 8,
+  plot.height = 8,
+  plot.font.size = 12
+)
+```

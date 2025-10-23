@@ -1,0 +1,57 @@
+Type: Package
+Package: MATCHA
+Title: Uncover transcription factors that drive complex gene programs -
+    across datasets, species, and measurement methods
+Version: 1.0.0
+Authors@R: 
+    person("Constantine", "Tzouanas", , "ct24@mit.edu", role = c("aut", "cre"),
+           comment = c(ORCID = "0000-0002-7536-1156"))
+Description: Computational package accompanying the paper "Metabolic
+    stress primes cancer by rebalancing cell and tissue functions". MATCHA
+    allows the user to uncover and prioritize transcription factors that
+    are "central hubs" regulating multiple user-specified gene programs
+    and specific cellular/tissue phenotypes. MATCHA: 1) leverages cell
+    type- and/or tissue-specific transcriptomic and epigenetic
+    relationships, towards capturing context-specific regulatory
+    interactions, 2) can emphasize robust and generalizable gene program
+    drivers by incorporating datasets spanning studies, cohorts and
+    species, and, 3) can uncover core, co-regulatory TFs capable of
+    activating or repressing each of multiple gene programs
+    simultaneously.
+License: MIT + file LICENSE
+Imports: 
+    BSgenome.Mmusculus.UCSC.mm10,
+    chromVAR,
+    cicero,
+    dplyr,
+    EnsDb.Mmusculus.v79,
+    GenomeInfoDb,
+    ggplot2,
+    ggraph,
+    ggrepel,
+    ggthemes,
+    grDevices,
+    igraph,
+    janitor,
+    JASPAR2020,
+    magrittr,
+    Matrix,
+    msigdbr,
+    network,
+    paletteer,
+    patchwork,
+    plyr,
+    readxl,
+    Seurat,
+    SeuratWrappers,
+    Signac,
+    stats,
+    stringr,
+    SummarizedExperiment,
+    TFBSTools,
+    tibble,
+    tidyr,
+    utils,
+    writexl
+Encoding: UTF-8
+RoxygenNote: 7.3.2
